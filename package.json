@@ -1,0 +1,24 @@
+{
+  "name": "ps2-multiplayer-server",
+  "version": "1.0.0",
+  "description": "Servidor multiplayer para PlayStation 2",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.14.2"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "keywords": [
+    "websocket",
+    "multiplayer",
+    "ps2",
+    "game-server"
+  ],
+  "author": "Você",
+  "license": "MIT"
+}
