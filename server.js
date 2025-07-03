@@ -4,7 +4,33 @@ const crypto = require('crypto');
 
 const PORT = process.env.PORT || 8080;
 const server = http.createServer();
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({ 
+    server,
+    perMessageDeflate: {
+        zlibDeflateOptions: {
+            chunkSize: 1024,
+            windowBits: 13,
+            level: 3
+        },
+        zlibInflateOptions: {
+            chunkSize: 1024,
+            windowBits: 13,
+            level: 3
+        },
+        threshold: 1024,
+        concurrencyLimit: 10,
+        clientMaxWindowBits: 13,
+        serverMaxWindowBits: 13,
+        serverMaxNoContextTakeover: false,
+        clientMaxNoContextTakeover: false,
+        compress: true,
+        zlibInflateOptions: {
+            chunkSize: 1024,
+            windowBits: 13,
+            level: 3
+        }
+    }
+});
 
 class GameServer {
     constructor() {
@@ -16,9 +42,10 @@ class GameServer {
             gameTime: 0
         };
         this.gameLoop = null;
-        this.tickRate = 20; 
+        this.tickRate = 20;
         this.nextPlayerId = 1;
-        this.connectionTimeout = 45000; 
+        this.connectionTimeout = 45000;
+        this.messageQueue = [];
         this.startGameLoop();
     }
 
@@ -34,34 +61,49 @@ class GameServer {
         this.gameLoop = setInterval(() => {
             this.gameState.gameTime += 1000 / this.tickRate;
             this.cleanupInactivePlayers();
+            this.processMessageQueue();
             this.broadcastGameState();
         }, 1000 / this.tickRate);
     }
 
     cleanupInactivePlayers() {
         const now = Date.now();
+        const playersToRemove = [];
         
         for (let [playerId, player] of this.players) {
             if (now - player.lastUpdate > this.connectionTimeout) {
                 console.log(`Player ${playerId} removido por inatividade`);
-                this.removePlayer(playerId);
+                playersToRemove.push(playerId);
             }
         }
+        
+        playersToRemove.forEach(playerId => {
+            this.removePlayer(playerId);
+        });
+    }
+
+    processMessageQueue() {
+  
+        const messagesToProcess = this.messageQueue.splice(0, 50);
+        
+        messagesToProcess.forEach(({ ws, playerId, message }) => {
+            this.handleMessage(ws, playerId, message);
+        });
     }
 
     addPlayer(ws, playerId) {
-      
-        if (this.players.has(playerId)) {
-            console.log(`Jogador ${playerId} já existe, removendo conexão anterior`);
-            const oldPlayer = this.players.get(playerId);
-            if (oldPlayer.ws && oldPlayer.ws.readyState === WebSocket.OPEN) {
-                oldPlayer.ws.close(1000, 'Reconnecting');
-            }
-            this.removePlayer(playerId);
-        }
+        try {
+       
 
-      
-        setTimeout(() => {
+            if (this.players.has(playerId)) {
+                console.log(`Jogador ${playerId} já existe, removendo conexão anterior`);
+                const oldPlayer = this.players.get(playerId);
+                if (oldPlayer.ws && oldPlayer.ws.readyState === WebSocket.OPEN) {
+                    oldPlayer.ws.close(1000, 'Reconnecting');
+                }
+                this.removePlayer(playerId);
+            }
+
             const player = {
                 id: playerId,
                 ws: ws,
@@ -72,7 +114,9 @@ class GameServer {
                 lastUpdate: Date.now(),
                 speed: 0.3,
                 color: this.generatePlayerColor(playerId),
-                connectionId: crypto.randomUUID()
+                connectionId: crypto.randomUUID(),
+                messagesSent: 0,
+                messagesReceived: 0
             };
 
             this.players.set(playerId, player);
@@ -88,19 +132,23 @@ class GameServer {
 
             console.log(`Player ${playerId} conectado. Total: ${this.players.size}`);
             
-        
+  
             this.sendSafeMessage(ws, {
                 type: 'player_connected',
                 playerId: playerId,
                 totalPlayers: this.players.size,
-                gameState: this.gameState
+                gameState: this.gameState,
+                serverTime: Date.now()
             });
 
       
             setTimeout(() => {
                 this.broadcastPlayerJoined(playerId);
             }, 100);
-        }, 50);
+
+        } catch (error) {
+            console.error(`Erro ao adicionar player ${playerId}:`, error);
+        }
     }
 
     removePlayer(playerId) {
@@ -118,10 +166,11 @@ class GameServer {
                     player.ws.close(1000, 'Disconnected');
                 }
                 
-          
+               
                 setTimeout(() => {
                     this.broadcastPlayerLeft(playerId);
                 }, 100);
+                
             } catch (error) {
                 console.error(`Erro ao remover player ${playerId}:`, error);
             }
@@ -131,26 +180,41 @@ class GameServer {
     updatePlayerPosition(playerId, data) {
         const player = this.players.get(playerId);
         if (player) {
-            player.position = data.position;
-            player.rotation = data.rotation;
-            player.animation = data.animation;
-            player.lastUpdate = Date.now();
+   
+            if (data.position && typeof data.position === 'object' &&
+                data.rotation && typeof data.rotation === 'object') {
+                
+                player.position = data.position;
+                player.rotation = data.rotation;
+                player.animation = data.animation || "root|Idle";
+                player.lastUpdate = Date.now();
 
-            this.gameState.players[playerId] = {
-                id: playerId,
-                position: player.position,
-                rotation: player.rotation,
-                animation: player.animation,
-                color: player.color
-            };
+                this.gameState.players[playerId] = {
+                    id: playerId,
+                    position: player.position,
+                    rotation: player.rotation,
+                    animation: player.animation,
+                    color: player.color
+                };
+            }
         }
     }
-
 
     sendSafeMessage(ws, data) {
         if (ws && ws.readyState === WebSocket.OPEN) {
             try {
-                ws.send(JSON.stringify(data));
+                const message = JSON.stringify(data);
+                ws.send(message);
+                
+           
+                const playerId = this.connections.get(ws);
+                if (playerId) {
+                    const player = this.players.get(playerId);
+                    if (player) {
+                        player.messagesSent++;
+                    }
+                }
+                
                 return true;
             } catch (error) {
                 console.error('Erro ao enviar mensagem:', error);
@@ -161,9 +225,12 @@ class GameServer {
     }
 
     broadcastGameState() {
+        if (this.players.size === 0) return;
+        
         const message = {
             type: 'game_state',
-            gameState: this.gameState
+            gameState: this.gameState,
+            timestamp: Date.now()
         };
 
         const playersToRemove = [];
@@ -174,7 +241,7 @@ class GameServer {
             }
         });
 
-    
+
         playersToRemove.forEach(playerId => {
             this.removePlayer(playerId);
         });
@@ -188,7 +255,8 @@ class GameServer {
             type: 'player_joined',
             playerId: playerId,
             playerData: playerData,
-            totalPlayers: this.players.size
+            totalPlayers: this.players.size,
+            timestamp: Date.now()
         };
 
         const playersToRemove = [];
@@ -210,7 +278,8 @@ class GameServer {
         const message = {
             type: 'player_left',
             playerId: playerId,
-            totalPlayers: this.players.size
+            totalPlayers: this.players.size,
+            timestamp: Date.now()
         };
 
         const playersToRemove = [];
@@ -252,6 +321,7 @@ class GameServer {
             
             const player = this.players.get(playerId);
             player.lastUpdate = Date.now();
+            player.messagesReceived++;
             
             switch (data.type) {
                 case 'position_update':
@@ -266,12 +336,12 @@ class GameServer {
                     });
                     break;
                     
-                case 'chat':
-                    this.broadcastChat(playerId, data.message);
-                    break;
-                    
                 case 'system_info':
-                    console.log(`Player ${playerId} system info:`, data);
+                    console.log(`Player ${playerId} system info:`, {
+                        platform: data.platform,
+                        runtime: data.runtime,
+                        network: data.network
+                    });
                     this.sendSafeMessage(ws, {
                         type: 'system_info_received',
                         message: 'System info received successfully'
@@ -284,37 +354,32 @@ class GameServer {
                     break;
                     
                 case 'heartbeat':
-              
                     this.sendSafeMessage(ws, {
                         type: 'heartbeat_response',
                         timestamp: Date.now()
                     });
                     break;
+                    
+                default:
+                    console.log(`Tipo de mensagem desconhecido: ${data.type}`);
             }
         } catch (error) {
             console.error(`Erro handling message from player ${playerId}:`, error);
         }
     }
 
-    broadcastChat(playerId, message) {
-        const chatMessage = {
-            type: 'chat',
-            playerId: playerId,
-            message: message,
-            timestamp: Date.now()
+    queueMessage(ws, playerId, message) {
+        this.messageQueue.push({ ws, playerId, message });
+    }
+
+    getServerStats() {
+        return {
+            players: this.players.size,
+            uptime: process.uptime(),
+            memoryUsage: process.memoryUsage(),
+            messageQueue: this.messageQueue.length,
+            gameTime: this.gameState.gameTime
         };
-
-        const playersToRemove = [];
-
-        this.players.forEach((player, id) => {
-            if (!this.sendSafeMessage(player.ws, chatMessage)) {
-                playersToRemove.push(id);
-            }
-        });
-
-        playersToRemove.forEach(id => {
-            this.removePlayer(id);
-        });
     }
 }
 
@@ -327,27 +392,29 @@ wss.on('connection', (ws, req) => {
     
     console.log(`Nova conexão WebSocket - Player ID: ${playerId} - IP: ${clientIP}`);
     
-  
+
     ws.isAlive = true;
     ws.on('pong', () => {
         ws.isAlive = true;
     });
     
-
+ 
     gameServer.sendSafeMessage(ws, {
         type: 'welcome',
         message: `Bem-vindo ao servidor multiplayer! Você é o jogador ${playerId}`,
-        playerId: playerId
+        playerId: playerId,
+        serverTime: Date.now()
     });
 
-
+  
     setTimeout(() => {
         gameServer.addPlayer(ws, playerId);
     }, 100);
 
+
     ws.on('message', (message) => {
         try {
-            gameServer.handleMessage(ws, playerId, message.toString());
+            gameServer.queueMessage(ws, playerId, message.toString());
         } catch (error) {
             console.error(`Erro ao processar mensagem do player ${playerId}:`, error);
         }
@@ -363,7 +430,6 @@ wss.on('connection', (ws, req) => {
         gameServer.removePlayer(playerId);
     });
 });
-
 
 const heartbeatInterval = setInterval(() => {
     wss.clients.forEach((ws) => {
@@ -381,6 +447,7 @@ const heartbeatInterval = setInterval(() => {
     });
 }, 30000);
 
+
 server.on('request', (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -394,18 +461,19 @@ server.on('request', (req, res) => {
     
     if (req.url === '/health') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ 
-            status: 'OK', 
-            players: gameServer.players.size,
-            uptime: process.uptime(),
-            timestamp: Date.now()
-        }));
+        res.end(JSON.stringify(gameServer.getServerStats()));
     } else if (req.url === '/players') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         const playerList = Array.from(gameServer.players.keys());
         res.end(JSON.stringify({
             players: playerList,
-            total: gameServer.players.size
+            total: gameServer.players.size,
+            details: Array.from(gameServer.players.values()).map(p => ({
+                id: p.id,
+                lastUpdate: p.lastUpdate,
+                messagesSent: p.messagesSent,
+                messagesReceived: p.messagesReceived
+            }))
         }));
     } else {
         res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -426,7 +494,6 @@ process.on('SIGINT', () => {
     
     clearInterval(heartbeatInterval);
     
- 
     const disconnectPromises = [];
     gameServer.players.forEach((player, playerId) => {
         disconnectPromises.push(new Promise((resolve) => {
