@@ -16,8 +16,9 @@ class GameServer {
             gameTime: 0
         };
         this.gameLoop = null;
-        this.tickRate = 30;
+        this.tickRate = 20; 
         this.nextPlayerId = 1;
+        this.connectionTimeout = 45000; 
         this.startGameLoop();
     }
 
@@ -39,10 +40,9 @@ class GameServer {
 
     cleanupInactivePlayers() {
         const now = Date.now();
-        const timeout = 30000;
         
         for (let [playerId, player] of this.players) {
-            if (now - player.lastUpdate > timeout) {
+            if (now - player.lastUpdate > this.connectionTimeout) {
                 console.log(`Player ${playerId} removido por inatividade`);
                 this.removePlayer(playerId);
             }
@@ -50,61 +50,81 @@ class GameServer {
     }
 
     addPlayer(ws, playerId) {
+      
         if (this.players.has(playerId)) {
             console.log(`Jogador ${playerId} já existe, removendo conexão anterior`);
+            const oldPlayer = this.players.get(playerId);
+            if (oldPlayer.ws && oldPlayer.ws.readyState === WebSocket.OPEN) {
+                oldPlayer.ws.close(1000, 'Reconnecting');
+            }
             this.removePlayer(playerId);
         }
 
-        const player = {
-            id: playerId,
-            ws: ws,
-            position: { x: 0, y: 0, z: 0 },
-            rotation: { x: 0, y: 0, z: 0 },
-            animation: "root|Idle",
-            connected: true,
-            lastUpdate: Date.now(),
-            speed: 0.3,
-            color: this.generatePlayerColor(playerId),
-            connectionId: crypto.randomUUID()
-        };
+      
+        setTimeout(() => {
+            const player = {
+                id: playerId,
+                ws: ws,
+                position: { x: 0, y: 0, z: 0 },
+                rotation: { x: 0, y: 0, z: 0 },
+                animation: "root|Idle",
+                connected: true,
+                lastUpdate: Date.now(),
+                speed: 0.3,
+                color: this.generatePlayerColor(playerId),
+                connectionId: crypto.randomUUID()
+            };
 
-        this.players.set(playerId, player);
-        this.connections.set(ws, playerId);
+            this.players.set(playerId, player);
+            this.connections.set(ws, playerId);
+            
+            this.gameState.players[playerId] = {
+                id: playerId,
+                position: player.position,
+                rotation: player.rotation,
+                animation: player.animation,
+                color: player.color
+            };
+
+            console.log(`Player ${playerId} conectado. Total: ${this.players.size}`);
+            
         
-        this.gameState.players[playerId] = {
-            id: playerId,
-            position: player.position,
-            rotation: player.rotation,
-            animation: player.animation,
-            color: player.color
-        };
+            this.sendSafeMessage(ws, {
+                type: 'player_connected',
+                playerId: playerId,
+                totalPlayers: this.players.size,
+                gameState: this.gameState
+            });
 
-        console.log(`Player ${playerId} conectado. Total: ${this.players.size}`);
-        
-        ws.send(JSON.stringify({
-            type: 'player_connected',
-            playerId: playerId,
-            totalPlayers: this.players.size,
-            gameState: this.gameState
-        }));
-
-        this.broadcastPlayerJoined(playerId);
+      
+            setTimeout(() => {
+                this.broadcastPlayerJoined(playerId);
+            }, 100);
+        }, 50);
     }
 
     removePlayer(playerId) {
         const player = this.players.get(playerId);
         if (player) {
-            this.connections.delete(player.ws);
-            this.players.delete(playerId);
-            delete this.gameState.players[playerId];
-            
-            console.log(`Player ${playerId} desconectado. Total: ${this.players.size}`);
-            
-            if (player.ws.readyState === WebSocket.OPEN) {
-                player.ws.close();
+            try {
+                this.connections.delete(player.ws);
+                this.players.delete(playerId);
+                delete this.gameState.players[playerId];
+                
+                console.log(`Player ${playerId} desconectado. Total: ${this.players.size}`);
+                
+             
+                if (player.ws && player.ws.readyState === WebSocket.OPEN) {
+                    player.ws.close(1000, 'Disconnected');
+                }
+                
+          
+                setTimeout(() => {
+                    this.broadcastPlayerLeft(playerId);
+                }, 100);
+            } catch (error) {
+                console.error(`Erro ao remover player ${playerId}:`, error);
             }
-            
-            this.broadcastPlayerLeft(playerId);
         }
     }
 
@@ -126,60 +146,83 @@ class GameServer {
         }
     }
 
+
+    sendSafeMessage(ws, data) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            try {
+                ws.send(JSON.stringify(data));
+                return true;
+            } catch (error) {
+                console.error('Erro ao enviar mensagem:', error);
+                return false;
+            }
+        }
+        return false;
+    }
+
     broadcastGameState() {
-        const message = JSON.stringify({
+        const message = {
             type: 'game_state',
             gameState: this.gameState
+        };
+
+        const playersToRemove = [];
+        
+        this.players.forEach((player, playerId) => {
+            if (!this.sendSafeMessage(player.ws, message)) {
+                playersToRemove.push(playerId);
+            }
         });
 
-        this.players.forEach((player, playerId) => {
-            if (player.ws.readyState === WebSocket.OPEN) {
-                try {
-                    player.ws.send(message);
-                } catch (error) {
-                    console.error(`Erro ao enviar para player ${playerId}:`, error);
-                    this.removePlayer(playerId);
-                }
-            }
+    
+        playersToRemove.forEach(playerId => {
+            this.removePlayer(playerId);
         });
     }
 
     broadcastPlayerJoined(playerId) {
-        const message = JSON.stringify({
+        const playerData = this.gameState.players[playerId];
+        if (!playerData) return;
+
+        const message = {
             type: 'player_joined',
             playerId: playerId,
-            playerData: this.gameState.players[playerId],
+            playerData: playerData,
             totalPlayers: this.players.size
-        });
+        };
+
+        const playersToRemove = [];
 
         this.players.forEach((player, id) => {
-            if (id !== playerId && player.ws.readyState === WebSocket.OPEN) {
-                try {
-                    player.ws.send(message);
-                } catch (error) {
-                    console.error(`Erro ao enviar player_joined para ${id}:`, error);
-                    this.removePlayer(id);
+            if (id !== playerId) {
+                if (!this.sendSafeMessage(player.ws, message)) {
+                    playersToRemove.push(id);
                 }
             }
+        });
+
+        playersToRemove.forEach(id => {
+            this.removePlayer(id);
         });
     }
 
     broadcastPlayerLeft(playerId) {
-        const message = JSON.stringify({
+        const message = {
             type: 'player_left',
             playerId: playerId,
             totalPlayers: this.players.size
-        });
+        };
+
+        const playersToRemove = [];
 
         this.players.forEach((player, id) => {
-            if (player.ws.readyState === WebSocket.OPEN) {
-                try {
-                    player.ws.send(message);
-                } catch (error) {
-                    console.error(`Erro ao enviar player_left para ${id}:`, error);
-                    this.removePlayer(id);
-                }
+            if (!this.sendSafeMessage(player.ws, message)) {
+                playersToRemove.push(id);
             }
+        });
+
+        playersToRemove.forEach(id => {
+            this.removePlayer(id);
         });
     }
 
@@ -187,12 +230,12 @@ class GameServer {
         const colors = [
             [255, 0, 0],    
             [0, 255, 0],    
-            [0, 0, 255],   
+            [0, 0, 255],    
             [255, 255, 0],  
             [255, 0, 255],  
             [0, 255, 255],  
             [255, 128, 0],  
-            [128, 0, 255]  
+            [128, 0, 255]   
         ];
         const index = parseInt(playerId) % colors.length;
         return colors[index];
@@ -207,17 +250,20 @@ class GameServer {
                 return;
             }
             
+            const player = this.players.get(playerId);
+            player.lastUpdate = Date.now();
+            
             switch (data.type) {
                 case 'position_update':
                     this.updatePlayerPosition(playerId, data);
                     break;
                     
                 case 'ping':
-                    ws.send(JSON.stringify({
+                    this.sendSafeMessage(ws, {
                         type: 'pong',
                         timestamp: data.timestamp,
                         serverTime: Date.now()
-                    }));
+                    });
                     break;
                     
                 case 'chat':
@@ -226,15 +272,23 @@ class GameServer {
                     
                 case 'system_info':
                     console.log(`Player ${playerId} system info:`, data);
-                    ws.send(JSON.stringify({
+                    this.sendSafeMessage(ws, {
                         type: 'system_info_received',
                         message: 'System info received successfully'
-                    }));
+                    });
                     break;
                     
                 case 'disconnect':
                     console.log(`Player ${playerId} enviou disconnect`);
                     this.removePlayer(playerId);
+                    break;
+                    
+                case 'heartbeat':
+              
+                    this.sendSafeMessage(ws, {
+                        type: 'heartbeat_response',
+                        timestamp: Date.now()
+                    });
                     break;
             }
         } catch (error) {
@@ -243,43 +297,60 @@ class GameServer {
     }
 
     broadcastChat(playerId, message) {
-        const chatMessage = JSON.stringify({
+        const chatMessage = {
             type: 'chat',
             playerId: playerId,
             message: message,
             timestamp: Date.now()
-        });
+        };
+
+        const playersToRemove = [];
 
         this.players.forEach((player, id) => {
-            if (player.ws.readyState === WebSocket.OPEN) {
-                try {
-                    player.ws.send(chatMessage);
-                } catch (error) {
-                    console.error(`Erro ao enviar chat para ${id}:`, error);
-                    this.removePlayer(id);
-                }
+            if (!this.sendSafeMessage(player.ws, chatMessage)) {
+                playersToRemove.push(id);
             }
+        });
+
+        playersToRemove.forEach(id => {
+            this.removePlayer(id);
         });
     }
 }
 
 const gameServer = new GameServer();
 
-wss.on('connection', (ws) => {
+
+wss.on('connection', (ws, req) => {
     const playerId = gameServer.generateUniquePlayerId();
+    const clientIP = req.connection.remoteAddress || req.socket.remoteAddress;
     
-    console.log(`Nova conexão WebSocket - Player ID: ${playerId}`);
+    console.log(`Nova conexão WebSocket - Player ID: ${playerId} - IP: ${clientIP}`);
     
-    ws.send(JSON.stringify({
+  
+    ws.isAlive = true;
+    ws.on('pong', () => {
+        ws.isAlive = true;
+    });
+    
+
+    gameServer.sendSafeMessage(ws, {
         type: 'welcome',
         message: `Bem-vindo ao servidor multiplayer! Você é o jogador ${playerId}`,
         playerId: playerId
-    }));
+    });
 
-    gameServer.addPlayer(ws, playerId);
+
+    setTimeout(() => {
+        gameServer.addPlayer(ws, playerId);
+    }, 100);
 
     ws.on('message', (message) => {
-        gameServer.handleMessage(ws, playerId, message.toString());
+        try {
+            gameServer.handleMessage(ws, playerId, message.toString());
+        } catch (error) {
+            console.error(`Erro ao processar mensagem do player ${playerId}:`, error);
+        }
     });
 
     ws.on('close', (code, reason) => {
@@ -294,13 +365,47 @@ wss.on('connection', (ws) => {
 });
 
 
+const heartbeatInterval = setInterval(() => {
+    wss.clients.forEach((ws) => {
+        if (ws.isAlive === false) {
+            const playerId = gameServer.connections.get(ws);
+            if (playerId) {
+                console.log(`Conexão morta detectada para player ${playerId}`);
+                gameServer.removePlayer(playerId);
+            }
+            return ws.terminate();
+        }
+        
+        ws.isAlive = false;
+        ws.ping();
+    });
+}, 30000);
+
 server.on('request', (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    
+    if (req.method === 'OPTIONS') {
+        res.writeHead(200);
+        res.end();
+        return;
+    }
+    
     if (req.url === '/health') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ 
             status: 'OK', 
             players: gameServer.players.size,
-            uptime: process.uptime()
+            uptime: process.uptime(),
+            timestamp: Date.now()
+        }));
+    } else if (req.url === '/players') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        const playerList = Array.from(gameServer.players.keys());
+        res.end(JSON.stringify({
+            players: playerList,
+            total: gameServer.players.size
         }));
     } else {
         res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -309,21 +414,45 @@ server.on('request', (req, res) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`=== Servidor Multiplayer PS2 ===`);
+    console.log('=== Servidor Multiplayer PS2 ===');
     console.log(`Servidor rodando na porta ${PORT}`);
     console.log(`WebSocket: ws://0.0.0.0:${PORT}`);
-    console.log(`Aguardando conexões...`);
+    console.log('Aguardando conexões...');
 });
+
 
 process.on('SIGINT', () => {
     console.log('\nDesligando servidor...');
+    
+    clearInterval(heartbeatInterval);
+    
+ 
+    const disconnectPromises = [];
     gameServer.players.forEach((player, playerId) => {
-        gameServer.removePlayer(playerId);
+        disconnectPromises.push(new Promise((resolve) => {
+            if (player.ws && player.ws.readyState === WebSocket.OPEN) {
+                player.ws.close(1000, 'Server shutting down');
+                setTimeout(resolve, 100);
+            } else {
+                resolve();
+            }
+        }));
     });
     
-    wss.close(() => {
-        server.close(() => {
-            process.exit(0);
+    Promise.all(disconnectPromises).then(() => {
+        wss.close(() => {
+            server.close(() => {
+                console.log('Servidor encerrado com sucesso');
+                process.exit(0);
+            });
         });
     });
+});
+
+process.on('uncaughtException', (error) => {
+    console.error('Erro não capturado:', error);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('Promise rejeitada:', reason);
 });
